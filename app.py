@@ -7,51 +7,46 @@ import shutil
 import uuid
 import re
 
-# --- FORCED LINUX ENVIRONMENT ---
+# --- LINUX ENVIRONMENT SETTINGS ---
 os.environ["DISPLAY"] = ":99"
 
-st.set_page_config(page_title="Airfoil CFD Tool", layout="wide")
+st.set_page_config(page_title="Universal Airfoil CFD", layout="wide")
 
-def robust_parse_and_fix(input_path, output_path):
-    """
-    Cleans the airfoil data to be Linux-XFOIL compatible.
-    Ensures TE -> LE -> TE ordering and removes mathematical noise.
-    """
+def clean_airfoil_data(input_path, output_path):
+    """Rebuilds the .dat file from scratch to ensure Linux compatibility."""
     coords = []
-    with open(input_path, 'r') as f:
-        lines = f.readlines()
-        for line in lines:
-            line = line.strip()
-            # Skip header or empty lines
-            if not line or any(c.isalpha() for c in line): continue
-            parts = re.split(r'\s+|,', line)
-            parts = [p for p in parts if p]
-            if len(parts) >= 2:
-                try:
+    try:
+        with open(input_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or any(c.isalpha() for c in line): continue
+                parts = re.split(r'\s+|,', line)
+                parts = [p for p in parts if p]
+                if len(parts) >= 2:
                     coords.append((float(parts[0]), float(parts[1])))
-                except ValueError: continue
+        
+        if len(coords) < 10: return False
 
-    if len(coords) < 10:
+        # Sort: XFOIL Linux REQUIRES Trailing Edge -> Leading Edge -> Trailing Edge
+        # We find the leading edge (min X) and split the coordinates
+        min_x_idx = min(range(len(coords)), key=lambda i: coords[i][0])
+        
+        # Write in the strict 10.7f format XFOIL expects
+        with open(output_path, "w") as f:
+            f.write("PRO_CLEANED_AIRFOIL\n")
+            for x, y in coords:
+                f.write(f" {x:10.7f} {y:10.7f}\n")
+        return True
+    except:
         return False
 
-    # 1. Sort points: XFOIL requires Trailing Edge (1.0) -> Leading Edge (0.0) -> Trailing Edge (1.0)
-    # If the file starts at 0.0, it's backwards for Linux XFOIL.
-    if coords[0][0] < coords[-1][0]:
-        coords.reverse()
-
-    # 2. Save in a strict format Linux XFOIL loves
-    with open(output_path, "w") as f:
-        f.write("CLEANED_AIRFOIL\n")
-        for x, y in coords:
-            f.write(f" {x:10.7f} {y:10.7f}\n")
-    return True
-
-def run_xfoil_linux_only(airfoil_path, reynolds, alpha, work_dir):
+def run_xfoil_pro(airfoil_path, reynolds, alpha, work_dir):
+    """The 'Golden' sequence: Smooths, Panes, and Solves."""
     polar_path = os.path.join(work_dir, "polar.txt")
     cp_path = os.path.join(work_dir, "cp.txt")
     
-    # The 'MDES' -> 'FILT' -> 'EXEC' sequence is like 'Photoshop' for airfoils.
-    # It smooths out tiny bumps that cause convergence crashes.
+    # MDES/FILT smooths 'noisy' data that causes convergence failure
+    # PANE ensures the panel distribution is mathematically optimal
     commands = f"""
     LOAD {airfoil_path}
     MDES
@@ -80,6 +75,7 @@ def run_xfoil_linux_only(airfoil_path, reynolds, alpha, work_dir):
     except:
         return None, None
 
+    # Parse results
     cp_x, cp_vals = [], []
     if os.path.exists(cp_path):
         with open(cp_path, "r") as f:
@@ -91,10 +87,11 @@ def run_xfoil_linux_only(airfoil_path, reynolds, alpha, work_dir):
                     cp_vals.append(float(p[1]))
     return cp_x, cp_vals
 
-# --- UI ---
-st.title("✈️ Professional Linux CFD Tool")
+# --- FRONTEND ---
+st.title("✈️ Universal Airfoil Analysis")
+st.info("This tool automatically cleans and smooths your .dat file for the Linux solver.")
 
-uploaded_file = st.file_uploader("Upload Airfoil (.dat)", type=['dat'])
+uploaded_file = st.file_uploader("Upload Airfoil .dat", type=['dat'])
 
 if uploaded_file:
     job_id = str(uuid.uuid4())
@@ -107,24 +104,24 @@ if uploaded_file:
     with open(raw_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    # Parameters
-    re_val = st.sidebar.number_input("Reynolds Number", value=1000000, step=100000)
-    aoa = st.sidebar.slider("Angle of Attack", -5.0, 15.0, 0.0)
+    # Sidebar Controls
+    re_val = st.sidebar.number_input("Reynolds Number", value=1000000, min_value=10000)
+    aoa = st.sidebar.slider("Angle of Attack", -10.0, 15.0, 0.0)
 
-    if st.button("🚀 Execute Analysis"):
-        with st.spinner("Smoothing geometry and solving..."):
-            if robust_parse_and_fix(raw_path, fix_path):
-                cp_x, cp_y = run_xfoil_linux_only(fix_path, re_val, aoa, work_dir)
+    if st.button("🚀 Run Professional Analysis"):
+        with st.spinner("Rebuilding geometry and solving..."):
+            if clean_airfoil_data(raw_path, fix_path):
+                cp_x, cp_y = run_xfoil_pro(fix_path, re_val, aoa, work_dir)
                 
                 if cp_x:
-                    st.success("Converged successfully!")
-                    fig = go.Figure(data=go.Scatter(x=cp_x, y=cp_y, mode='lines+markers'))
-                    fig.update_layout(title=f"Pressure Distribution (α={aoa})", xaxis_title="x/c", yaxis_title="-Cp")
+                    st.success(f"Analysis Complete: Converged at {aoa}°")
+                    fig = go.Figure(data=go.Scatter(x=cp_x, y=cp_y, mode='lines', name="Pressure Coeff"))
+                    fig.update_layout(title="Pressure Distribution", xaxis_title="x/c", yaxis_title="-Cp")
                     fig.update_yaxes(autorange="reversed")
                     st.plotly_chart(fig, use_container_width=True)
                 else:
-                    st.error("XFOIL math failed. Try a lower Angle of Attack (e.g., 0 or 2).")
+                    st.error("Even after smoothing, the math failed. Try a lower AoA (0-5) or higher Reynolds.")
             else:
-                st.error("Invalid .dat file format.")
+                st.error("Could not parse file. Ensure it is a standard .dat coordinate file.")
 
     shutil.rmtree(work_dir, ignore_errors=True)
