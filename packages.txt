@@ -1,2 +1,3 @@
 xfoil
 xvfb
+libgl1-mesa-glx
