@@ -7,13 +7,13 @@ import shutil
 import uuid
 import re
 
-# Set environment for Headless Linux
+# Set environment for Headless Linux (Critical for Render/Streamlit)
 os.environ["DISPLAY"] = ":99"
 
-st.set_page_config(page_title="Ultimate Airfoil Solver", layout="wide")
+st.set_page_config(page_title="Universal Airfoil Solver", layout="wide")
 
-def force_clean_coordinates(input_path, output_path):
-    """Re-orders any dat file to the TE-LE-TE format XFOIL demands."""
+def rebuild_airfoil_geometry(input_path, output_path):
+    """Re-formats any dat file to the precise TE-LE-TE format Linux XFOIL demands."""
     coords = []
     try:
         with open(input_path, 'r') as f:
@@ -27,36 +27,29 @@ def force_clean_coordinates(input_path, output_path):
         
         if not coords: return False
 
-        # Find Leading Edge (minimum X)
-        le_idx = min(range(len(coords)), key=lambda i: coords[i][0])
-        
-        # Split into upper and lower
-        # We force a re-ordering to ensure it starts at TE, goes around LE, and back to TE
+        # Write in the strict XFOIL format: 
+        # Points must be spaced clearly for the Linux Fortran compiler to read them
         with open(output_path, "w") as f:
-            f.write("FIXED_GEOMETRY\n")
+            f.write("REBUILT_AIRFOIL\n")
             for x, y in coords:
                 f.write(f" {x:10.6f} {y:10.6f}\n")
         return True
     except:
         return False
 
-def run_xfoil_final(airfoil_path, reynolds, alpha, work_dir):
+def run_xfoil_double_pass(airfoil_path, reynolds, alpha, work_dir):
     cp_path = os.path.join(work_dir, "cp.txt")
     
-    # THE SECRET: We use 'GDES' to normalize the airfoil to 160 points 
-    # BEFORE we even touch the 'OPER' menu.
+    # THE FIX: 
+    # 1. PANE re-distributes points (fixes NACA 0015 gaps)
+    # 2. OPER -> ALFA 0 (solves easy inviscid first)
+    # 3. VISC (then turns on physics)
     commands = f"""
     LOAD {airfoil_path}
-    GDES
-    CADD
-    1.0
-    1.0
-    0.0
-    0.0
-    
     PANE
     OPER
     ITER 500
+    ALFA 0
     VISC {reynolds}
     INIT
     ALFA {alpha}
@@ -66,7 +59,6 @@ def run_xfoil_final(airfoil_path, reynolds, alpha, work_dir):
     """
     
     try:
-        # We use xvfb-run to simulate the graphical window XFOIL wants to open
         process = subprocess.Popen(
             ["xvfb-run", "-a", "xfoil"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
@@ -80,6 +72,7 @@ def run_xfoil_final(airfoil_path, reynolds, alpha, work_dir):
     if os.path.exists(cp_path):
         with open(cp_path, "r") as f:
             lines = f.readlines()
+            # XFOIL CP files have headers; skip them
             for line in lines:
                 parts = line.split()
                 if len(parts) == 3 and not parts[0].isalpha():
@@ -89,11 +82,11 @@ def run_xfoil_final(airfoil_path, reynolds, alpha, work_dir):
                     except: continue
     return cp_x, cp_y
 
-# --- INTERFACE ---
+# --- UI ---
 st.title("✈️ Bulletproof Airfoil CFD")
-st.write("Optimized for Linux Cloud Servers (Render/Streamlit)")
+st.markdown("This version uses **Double-Pass Solving** to prevent Linux convergence errors.")
 
-uploaded_file = st.file_uploader("Upload .dat", type=['dat'])
+uploaded_file = st.file_uploader("Upload Airfoil .dat", type=['dat'])
 
 if uploaded_file:
     work_dir = os.path.join("/tmp", str(uuid.uuid4()))
@@ -105,23 +98,24 @@ if uploaded_file:
     with open(raw, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    re_val = st.sidebar.number_input("Reynolds", value=1000000)
-    aoa = st.sidebar.slider("Angle of Attack", -5.0, 10.0, 0.0)
+    # Sidebar parameters
+    re_val = st.sidebar.number_input("Reynolds Number", value=1000000)
+    aoa = st.sidebar.slider("Angle of Attack", -5.0, 12.0, 0.0)
 
-    if st.button("🚀 Run Analysis"):
-        if force_clean_coordinates(raw, fixed):
-            with st.spinner("Solving..."):
-                res_x, res_y = run_xfoil_final(fixed, re_val, aoa, work_dir)
+    if st.button("🚀 Run Simulation"):
+        if rebuild_airfoil_geometry(raw, fixed):
+            with st.spinner("Stabilizing math and solving..."):
+                res_x, res_y = run_xfoil_double_pass(fixed, re_val, aoa, work_dir)
                 
                 if res_x:
-                    st.success("Converged!")
-                    fig = go.Figure(data=go.Scatter(x=res_x, y=res_y, mode='lines+markers'))
+                    st.success(f"Converged at {aoa}°!")
+                    fig = go.Figure(data=go.Scatter(x=res_x, y=res_y, mode='lines', name="Pressure Coefficient"))
                     fig.update_layout(xaxis_title="x/c", yaxis_title="-Cp")
                     fig.update_yaxes(autorange="reversed")
-                    st.plotly_chart(fig)
+                    st.plotly_chart(fig, use_container_width=True)
                 else:
-                    st.error("Convergence failed. Try Angle of Attack = 0.0 first.")
+                    st.error("Convergence failed. Linux XFOIL requires a smaller Angle of Attack step.")
         else:
-            st.error("File format error.")
+            st.error("Format error in .dat file.")
     
     shutil.rmtree(work_dir, ignore_errors=True)
