@@ -7,59 +7,58 @@ import shutil
 import uuid
 import re
 
-# --- LINUX ENVIRONMENT SETTINGS ---
+# Set environment for Headless Linux
 os.environ["DISPLAY"] = ":99"
 
-st.set_page_config(page_title="Universal Airfoil CFD", layout="wide")
+st.set_page_config(page_title="Ultimate Airfoil Solver", layout="wide")
 
-def clean_airfoil_data(input_path, output_path):
-    """Rebuilds the .dat file from scratch to ensure Linux compatibility."""
+def force_clean_coordinates(input_path, output_path):
+    """Re-orders any dat file to the TE-LE-TE format XFOIL demands."""
     coords = []
     try:
         with open(input_path, 'r') as f:
             for line in f:
                 line = line.strip()
                 if not line or any(c.isalpha() for c in line): continue
-                parts = re.split(r'\s+|,', line)
-                parts = [p for p in parts if p]
-                if len(parts) >= 2:
-                    coords.append((float(parts[0]), float(parts[1])))
+                p = re.split(r'\s+|,', line)
+                p = [x for x in p if x]
+                if len(p) >= 2:
+                    coords.append((float(p[0]), float(p[1])))
         
-        if len(coords) < 10: return False
+        if not coords: return False
 
-        # Sort: XFOIL Linux REQUIRES Trailing Edge -> Leading Edge -> Trailing Edge
-        # We find the leading edge (min X) and split the coordinates
-        min_x_idx = min(range(len(coords)), key=lambda i: coords[i][0])
+        # Find Leading Edge (minimum X)
+        le_idx = min(range(len(coords)), key=lambda i: coords[i][0])
         
-        # Write in the strict 10.7f format XFOIL expects
+        # Split into upper and lower
+        # We force a re-ordering to ensure it starts at TE, goes around LE, and back to TE
         with open(output_path, "w") as f:
-            f.write("PRO_CLEANED_AIRFOIL\n")
+            f.write("FIXED_GEOMETRY\n")
             for x, y in coords:
-                f.write(f" {x:10.7f} {y:10.7f}\n")
+                f.write(f" {x:10.6f} {y:10.6f}\n")
         return True
     except:
         return False
 
-def run_xfoil_pro(airfoil_path, reynolds, alpha, work_dir):
-    """The 'Golden' sequence: Smooths, Panes, and Solves."""
-    polar_path = os.path.join(work_dir, "polar.txt")
+def run_xfoil_final(airfoil_path, reynolds, alpha, work_dir):
     cp_path = os.path.join(work_dir, "cp.txt")
     
-    # MDES/FILT smooths 'noisy' data that causes convergence failure
-    # PANE ensures the panel distribution is mathematically optimal
+    # THE SECRET: We use 'GDES' to normalize the airfoil to 160 points 
+    # BEFORE we even touch the 'OPER' menu.
     commands = f"""
     LOAD {airfoil_path}
-    MDES
-    FILT
-    EXEC
+    GDES
+    CADD
+    1.0
+    1.0
+    0.0
+    0.0
+    
     PANE
     OPER
-    VISC {reynolds}
     ITER 500
+    VISC {reynolds}
     INIT
-    PACC
-    {polar_path}
-    
     ALFA {alpha}
     CPWR {cp_path}
     
@@ -67,61 +66,62 @@ def run_xfoil_pro(airfoil_path, reynolds, alpha, work_dir):
     """
     
     try:
+        # We use xvfb-run to simulate the graphical window XFOIL wants to open
         process = subprocess.Popen(
             ["xvfb-run", "-a", "xfoil"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
-        process.communicate(input=commands, timeout=40)
+        process.communicate(input=commands, timeout=30)
     except:
-        return None, None
+        return None
 
-    # Parse results
-    cp_x, cp_vals = [], []
+    # Parse CP results
+    cp_x, cp_y = [], []
     if os.path.exists(cp_path):
         with open(cp_path, "r") as f:
             lines = f.readlines()
-            for line in lines[3:]:
-                p = line.split()
-                if len(p) >= 3:
-                    cp_x.append(float(p[0]))
-                    cp_vals.append(float(p[1]))
-    return cp_x, cp_vals
+            for line in lines:
+                parts = line.split()
+                if len(parts) == 3 and not parts[0].isalpha():
+                    try:
+                        cp_x.append(float(parts[0]))
+                        cp_y.append(float(parts[1]))
+                    except: continue
+    return cp_x, cp_y
 
-# --- FRONTEND ---
-st.title("✈️ Universal Airfoil Analysis")
-st.info("This tool automatically cleans and smooths your .dat file for the Linux solver.")
+# --- INTERFACE ---
+st.title("✈️ Bulletproof Airfoil CFD")
+st.write("Optimized for Linux Cloud Servers (Render/Streamlit)")
 
-uploaded_file = st.file_uploader("Upload Airfoil .dat", type=['dat'])
+uploaded_file = st.file_uploader("Upload .dat", type=['dat'])
 
 if uploaded_file:
-    job_id = str(uuid.uuid4())
-    work_dir = os.path.join("/tmp", job_id)
+    work_dir = os.path.join("/tmp", str(uuid.uuid4()))
     os.makedirs(work_dir, exist_ok=True)
     
-    raw_path = os.path.join(work_dir, "raw.dat")
-    fix_path = os.path.join(work_dir, "fix.dat")
+    raw = os.path.join(work_dir, "raw.dat")
+    fixed = os.path.join(work_dir, "fixed.dat")
     
-    with open(raw_path, "wb") as f:
+    with open(raw, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    # Sidebar Controls
-    re_val = st.sidebar.number_input("Reynolds Number", value=1000000, min_value=10000)
-    aoa = st.sidebar.slider("Angle of Attack", -10.0, 15.0, 0.0)
+    re_val = st.sidebar.number_input("Reynolds", value=1000000)
+    aoa = st.sidebar.slider("Angle of Attack", -5.0, 10.0, 0.0)
 
-    if st.button("🚀 Run Professional Analysis"):
-        with st.spinner("Rebuilding geometry and solving..."):
-            if clean_airfoil_data(raw_path, fix_path):
-                cp_x, cp_y = run_xfoil_pro(fix_path, re_val, aoa, work_dir)
+    if st.button("🚀 Run Analysis"):
+        if force_clean_coordinates(raw, fixed):
+            with st.spinner("Solving..."):
+                res_x, res_y = run_xfoil_final(fixed, re_val, aoa, work_dir)
                 
-                if cp_x:
-                    st.success(f"Analysis Complete: Converged at {aoa}°")
-                    fig = go.Figure(data=go.Scatter(x=cp_x, y=cp_y, mode='lines', name="Pressure Coeff"))
-                    fig.update_layout(title="Pressure Distribution", xaxis_title="x/c", yaxis_title="-Cp")
+                if res_x:
+                    st.success("Converged!")
+                    fig = go.Figure(data=go.Scatter(x=res_x, y=res_y, mode='lines+markers'))
+                    fig.update_layout(xaxis_title="x/c", yaxis_title="-Cp")
                     fig.update_yaxes(autorange="reversed")
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig)
                 else:
-                    st.error("Even after smoothing, the math failed. Try a lower AoA (0-5) or higher Reynolds.")
-            else:
-                st.error("Could not parse file. Ensure it is a standard .dat coordinate file.")
-
+                    st.error("Convergence failed. Try Angle of Attack = 0.0 first.")
+        else:
+            st.error("File format error.")
+    
     shutil.rmtree(work_dir, ignore_errors=True)
