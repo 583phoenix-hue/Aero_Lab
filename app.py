@@ -1,55 +1,31 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import numpy as np
 import os
 import subprocess
 import shutil
 import uuid
 import re
 
-# --- LINUX SERVER CONFIG ---
-if "DISPLAY" not in os.environ:
-    os.environ["DISPLAY"] = ":99"
+# --- FORCED LINUX ENVIRONMENT ---
+# This tells the server to use a fake display for XFOIL's graphics
+os.environ["DISPLAY"] = ":99"
 
-st.set_page_config(page_title="Airfoil CFD Tool", layout="wide", page_icon="✈️")
-
-def parse_dat_file(filepath):
-    coords = []
-    with open(filepath, 'r') as f:
-        lines = f.readlines()
-        for line in lines:
-            line = line.strip()
-            if not line or any(c.isalpha() for c in line): continue
-            parts = re.split(r'\s+|,', line)
-            parts = [p for p in parts if p]
-            if len(parts) >= 2:
-                try:
-                    coords.append((float(parts[0]), float(parts[1])))
-                except ValueError: continue
-    
-    # --- NEW: GEOMETRY AUTO-FIXER ---
-    # XFOIL fails if points aren't sorted from trailing edge -> leading edge -> trailing edge
-    if len(coords) > 0 and coords[0][0] < coords[-1][0]:
-        coords.reverse() 
-    return coords
-
-def run_xfoil_linux(fix_path, reynolds, alpha, work_dir):
+def run_xfoil_linux_only(airfoil_path, reynolds, alpha, work_dir):
     polar_path = os.path.join(work_dir, "polar.txt")
     cp_path = os.path.join(work_dir, "cp.txt")
     
-    # --- NEW: AGGRESSIVE COMMAND SEQUENCE ---
-    # Added 'MDES' -> 'FILT' to smooth out any "bumps" in your .dat file
-    # Increased ITER to 500 for maximum attempt time
+    # Professional Linux-XFOIL Sequence
+    # 'PANE' and 'MDES' are essential for Linux stability
     commands = f"""
-    LOAD {fix_path}
-    MDES
-    FILT
-    EXEC
+    PLOP
+    G
+    
+    LOAD {airfoil_path}
     PANE
     OPER
-    ITER 500
     VISC {reynolds}
+    ITER 500
     INIT
     PACC
     {polar_path}
@@ -60,66 +36,60 @@ def run_xfoil_linux(fix_path, reynolds, alpha, work_dir):
     QUIT
     """
     
-    process = subprocess.Popen(
-        ["xvfb-run", "-a", "xfoil"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-    )
-    process.communicate(input=commands)
-    
+    # We call 'xvfb-run' directly in the command
+    try:
+        process = subprocess.Popen(
+            ["xvfb-run", "-a", "xfoil"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        stdout, stderr = process.communicate(input=commands, timeout=30)
+    except Exception as e:
+        return None, None
+
+    # Parsing the output
     cp_x, cp_vals = [], []
     if os.path.exists(cp_path):
         with open(cp_path, "r") as f:
             lines = f.readlines()
-            for line in lines[3:]:
+            for line in lines[3:]: # Skip XFOIL header
                 p = line.split()
                 if len(p) >= 3:
                     cp_x.append(float(p[0]))
                     cp_vals.append(float(p[1]))
     return cp_x, cp_vals
 
-# --- FRONTEND (Identical to your original) ---
+# --- FRONTEND ---
+st.title("✈️ Linux-Optimized Airfoil Tool")
 
-st.title("✈️ Professional Airfoil Analysis")
-st.markdown("If convergence fails, try clicking **'Run Analysis'** a second time or lower the **Angle of Attack**.")
-
-uploaded_file = st.file_uploader("Upload Airfoil .dat file", type=['dat'])
+uploaded_file = st.file_uploader("Upload .dat file", type=['dat'])
 
 if uploaded_file:
+    # Use the Linux /tmp directory for maximum compatibility
     job_id = str(uuid.uuid4())
-    work_dir = f"temp_{job_id}"
+    work_dir = os.path.join("/tmp", job_id)
     os.makedirs(work_dir, exist_ok=True)
     
-    input_path = os.path.join(work_dir, "airfoil.dat")
-    fix_path = os.path.join(work_dir, "fix.dat")
-    with open(input_path, "wb") as f:
+    file_path = os.path.join(work_dir, "airfoil.dat")
+    with open(file_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    st.sidebar.header("Simulation Settings")
-    re_val = st.sidebar.number_input("Reynolds Number", value=1000000, min_value=10000)
-    aoa = st.sidebar.slider("Angle of Attack (Degrees)", -10.0, 15.0, 5.0)
+    re_val = st.sidebar.number_input("Reynolds", value=1000000)
+    aoa = st.sidebar.slider("AoA", -5.0, 15.0, 2.0)
 
-    if st.button("🚀 Run Analysis"):
-        with st.spinner("Smoothing geometry and solving..."):
-            raw_coords = parse_dat_file(input_path)
+    if st.button("Run Simulation"):
+        with st.spinner("Processing on Linux Server..."):
+            cp_x, cp_y = run_xfoil_linux_only(file_path, re_val, aoa, work_dir)
             
-            if not raw_coords:
-                st.error("Could not read coordinates. Check your .dat file format.")
+            if cp_x:
+                st.success("Converged!")
+                fig = go.Figure(data=go.Scatter(x=cp_x, y=cp_y, mode='lines'))
+                fig.update_yaxes(autorange="reversed")
+                st.plotly_chart(fig)
             else:
-                with open(fix_path, "w") as f:
-                    f.write("AIRFOIL\n")
-                    for x, y in raw_coords:
-                        f.write(f"  {x:.6f}  {y:.6f}\n")
-                
-                cp_x, cp_vals = run_xfoil_linux(fix_path, re_val, aoa, work_dir)
-                
-                if cp_x:
-                    st.success(f"Analysis Complete at α={aoa}°")
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(x=cp_x, y=cp_vals, mode='lines', line=dict(color='blue')))
-                    fig.update_layout(title="Pressure Distribution", xaxis_title="x/c", yaxis_title="-Cp")
-                    fig.update_yaxes(autorange="reversed")
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.error("Convergence failed. This usually happens if the Angle of Attack is too high for this specific airfoil shape.")
-    
+                st.error("Convergence failed. Linux XFOIL requires very clean .dat files.")
+
+    # Cleanup
     shutil.rmtree(work_dir, ignore_errors=True)
